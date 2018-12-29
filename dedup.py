@@ -43,22 +43,43 @@ def main():
 
     locale.setlocale(locale.LC_ALL, '')
 
-    logging.basicConfig(level=args.log_level)
-    logging.info(args)
-
-    if os.isatty(0) and not logging.getLogger().isEnabledFor(logging.DEBUG):
-        Ticker.enable()
-
-    if args.history is None:
-        args.history = os.path.join(os.path.expanduser('~'), HISTORY_CSV)
+    logging.basicConfig(format='[%(levelname)s] %(message)s', level=args.log_level)
+    logging.debug(args)
 
     fileinfos = gather_files(args.dirs, args.min_file_size, args.ignore_dot_dir, args.ignore_dot_files)
 
     dedup(fileinfos, args.history)
 
 
+def parse_args():
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument('dirs', metavar='DIRECTORY', nargs='*', default=[os.getcwd()],
+                           type=validate_path,
+                           help='directories to dedup (default: ["."])')
+    argparser.add_argument('--dot-files', action='store_false', dest='ignore_dot_files',
+                           help='include .* files (default: False)')
+    argparser.add_argument('--dot-dirs', action='store_false', dest='ignore_dot_dir',
+                           help='include .* directories (default: False)')
+    argparser.add_argument('-m', '--min-file-size', metavar='bytes', type=int, default=MIN_FILE_SIZE,
+                           help='minimum file size that will get linked (default: %d)' % MIN_FILE_SIZE)
+    argparser.add_argument('-H', '--history', metavar='CSV',
+                           help='previous CSV file (default: ~/%s)' % HISTORY_CSV)
+    verbosity = argparser.add_mutually_exclusive_group()
+    verbosity.add_argument('-q', '--quiet', action='store_const', dest='log_level',
+                           const=logging.WARNING, default=logging.INFO)
+    verbosity.add_argument('-v', '--verbose', action='store_const', dest='log_level',
+                           const=logging.DEBUG)
+
+    args = argparser.parse_args()
+
+    if args.history is None:
+        args.history = os.path.join(os.path.expanduser('~'), HISTORY_CSV)
+
+    return args
+
+
 def dedup(fileinfos, history_file):
-    create_hash.load_history(history_file)
+    HashGenerator.load_history(history_file)
 
     recovered_bytes = 0
     try:
@@ -71,43 +92,8 @@ def dedup(fileinfos, history_file):
     except KeyboardInterrupt:
         logging.warning('quiting (recieved <ctrl-c>)')
 
-    create_hash.save_history()
+    HashGenerator.save_history()
     logging.info('recovered: %s bytes', locale.format('%d', int(recovered_bytes), grouping=True))
-
-
-class Ticker:
-    cout = sys.stdout
-
-    @classmethod
-    def _tick(cls, mark='.'):
-        print(mark, file=cls.cout, end='')
-        cls.cout.flush()  # for py2.7, since flush=True doesn't work
-
-    @classmethod
-    def _no_tick(*args):
-        pass
-
-    tick = _no_tick
-
-    @classmethod
-    def enable(cls):
-        cls.tick = cls._tick
-
-    @classmethod
-    def disable(cls):
-        cls.tick = cls._no_tick
-
-    @classmethod
-    def isenabled(cls):
-        return cls.tick == cls._tick
-
-    @classmethod
-    def found_file(cls):
-        cls.tick('.')
-
-    @classmethod
-    def found_group(cls):
-        cls.tick('o')
 
 
 def group_duplicates(filepaths):
@@ -117,24 +103,21 @@ def group_duplicates(filepaths):
     fileinfo_by_hash = {}
     for key, group in itertools.groupby(filepaths, key=operator.attrgetter('size', 'device')):
         group = list(group)
-        Ticker.found_group()
         if all_same(f.inode for f in group):
             # Group already linked to same data
             continue
 
+        logging.debug('found group (%d items)', len(group))
         # Let's find possible duplicates by hashing files of the same size
         for finfo in group:
-            Ticker.found_file()
-            fileinfo_by_hash.setdefault(create_hash(finfo, (finfo.device, finfo.inode)), []).append(finfo)
+            logging.debug('\tfound file: %r', finfo.path)
+            fileinfo_by_hash.setdefault(HashGenerator.create_hash(finfo, (finfo.device, finfo.inode)), []).append(finfo)
 
         # Now, link the duplicates
         for duplicate_group in fileinfo_by_hash.values():
             yield duplicate_group
 
         fileinfo_by_hash.clear()
-
-    if Ticker.isenabled():
-        print(file=Ticker.cout)
 
 
 def link_duplicates(finfo_group):
@@ -152,12 +135,12 @@ def link_duplicates(finfo_group):
             os.link(source.path, link.path)
             recovered_bytes += link.size
         except KeyboardInterrupt:
-            logging.warn('cleaning up after <ctrl>-c', link.path, source.path)
+            logging.warning('cleaning up after <ctrl>-c', link.path, source.path)
             if os.path.exists(old_link):
                 os.rename(old_link, link.path)
             raise
         except:
-            logging.warn('could not link "%s" from "%s"', link.path, source.path)
+            logging.warning('could not link "%s" from "%s"', link.path, source.path)
             if os.path.exists(old_link):
                 os.rename(old_link, link.path)
         else:
@@ -253,20 +236,21 @@ def _scan_dir(fulldir, files, min_file_size, ignore_dot_files):
 
 
 class HashGenerator(object):
-    def __init__(self, chunk_size):
-        self._hash_by_ino = {}
-        self._chunk_size = chunk_size
-        self._history_file = None
-        self._dirty = False
+    chunk_size = CHUNK_SIZE
+    history_file = None
 
-    def __call__(self, fileinfo, inode=None):
+    _hash_by_ino = {}
+    _dirty = False
+
+    @classmethod
+    def create_hash(cls, fileinfo, inode=None):
         fpath = fileinfo.path
         if inode is None:
             stats = os.stat(fpath)
             inode = (stats.st_dev, stats.st_ino)
 
-        if inode in self._hash_by_ino:
-            filehash, mtime = self._hash_by_ino[inode]
+        if inode in cls._hash_by_ino:
+            filehash, mtime = cls._hash_by_ino[inode]
             if mtime == fileinfo.mtime:
                 logging.debug('file %s already scanned', fpath)
                 return filehash
@@ -274,70 +258,50 @@ class HashGenerator(object):
 
         sha = hashlib.sha256()
         with open(fpath, 'rb') as f:
-            read_chunk = functools.partial(f.read, self._chunk_size)
+            read_chunk = functools.partial(f.read, cls.chunk_size)
             for chunk in iter(read_chunk, CHUNKING_SENTINEL):
                 sha.update(chunk)
 
         hash_ = sha.hexdigest()
-        self._hash_by_ino[inode] = (hash_, fileinfo.mtime)
-        self._dirty = True
+        cls._hash_by_ino[inode] = (hash_, fileinfo.mtime)
+        cls._dirty = True
         logging.debug('file %s scanned as %r', fpath, hash_)
         return hash_
 
-    def load_history(self, history_file):
-        self._history_file = history_file
+    @classmethod
+    def load_history(cls, history_file):
+        if cls.history_file is not None:
+            logging.warning('history file already loaded')
+            return
+
+        cls.history_file = history_file
         try:
             with open(history_file, 'r') as fin:
                 csvr = csv.DictReader(fin)
                 for r in csvr:
                     h = make_history_info(**r)
-                    self._hash_by_ino[(h.device, h.inode)] = (h.filehash, h.mtime)
+                    cls._hash_by_ino[(h.device, h.inode)] = (h.filehash, h.mtime)
         except IOError:
-            logging.warn('missing history data; hashing all files')
+            logging.warning('missing history data; hashing all files')
         else:
-            logging.info('loaded history file (%d items) from %s', len(self._hash_by_ino), history_file)
+            logging.info('loaded history file (%d items) from %s', len(cls._hash_by_ino), history_file)
 
-    def save_history(self):
-        if not self._dirty:
+    @classmethod
+    def save_history(cls):
+        if not cls._dirty:
             return
 
-        tmp_history_csv = os.path.join(os.path.dirname(self._history_file), 'tmp.' + os.path.basename(self._history_file))
+        tmp_history_csv = os.path.join(os.path.dirname(cls.history_file), 'tmp.' + os.path.basename(cls.history_file))
 
         with open(tmp_history_csv, 'w') as fout:
             csvw = csv.DictWriter(fout, fieldnames=HistoryInfo._fields)
             csvw.writerow(dict((k, k) for k in HistoryInfo._fields))
 
-            for (device, inode), (filehash, mtime) in self._hash_by_ino.items():
+            for (device, inode), (filehash, mtime) in cls._hash_by_ino.items():
                 csvw.writerow(dict(device=device, inode=inode, mtime=mtime, filehash=filehash))
 
-        os.rename(tmp_history_csv, self._history_file)
-        logging.info('wrote history (%d items) to %s', len(self._hash_by_ino), self._history_file)
-
-create_hash = HashGenerator(chunk_size=CHUNK_SIZE)
-
-
-def parse_args():
-    argparser = argparse.ArgumentParser()
-    argparser.add_argument('dirs', metavar='DIRECTORY', nargs='*', default=[os.getcwd()],
-                           type=validate_path,
-                           help='directories to dedup (default: ["."])')
-    argparser.add_argument('--dot-files', action='store_false', dest='ignore_dot_files',
-                           help='include .* files (default: False)')
-    argparser.add_argument('--dot-dirs', action='store_false', dest='ignore_dot_dir',
-                           help='include .* directories (default: False)')
-    argparser.add_argument('-m', '--min-file-size', metavar='bytes', type=int, default=MIN_FILE_SIZE,
-                           help='minimum file size that will get linked (default: %d)' % MIN_FILE_SIZE)
-    argparser.add_argument('-H', '--history', metavar='CSV',
-                           help='previous CSV file (default: ~/%s)' % HISTORY_CSV)
-    verbosity = argparser.add_mutually_exclusive_group()
-    verbosity.add_argument('-q', '--quiet', action='store_const', dest='log_level',
-                           const=logging.WARNING, default=logging.INFO)
-    verbosity.add_argument('-v', '--verbose', action='store_const', dest='log_level',
-                           const=logging.DEBUG)
-
-    args = argparser.parse_args()
-
-    return args
+        os.rename(tmp_history_csv, cls.history_file)
+        logging.info('wrote history (%d items) to %s', len(cls._hash_by_ino), cls.history_file)
 
 
 if __name__ == '__main__':
