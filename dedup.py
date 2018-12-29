@@ -1,11 +1,8 @@
 #!/usr/bin/env python
 
 """
-Hardlink duplicate files found in directory trees. Files on separate
-partitions are not linked to each other.
-
-TODO:
-* create symlinks between partitions for duplicate files.
+Hard link duplicate files found in directory trees. Files on separate
+devicds/partitions are not linked to each other.
 
 Use "find . -type f -links 1" to see what's unique.
 """
@@ -42,27 +39,9 @@ else:
 
 
 def main():
+    args = parse_args()
+
     locale.setlocale(locale.LC_ALL, '')
-
-    argparser = argparse.ArgumentParser()
-    argparser.add_argument('dirs', metavar='DIRECTORY', nargs='*', default=[os.getcwd()],
-                           type=validate_path,
-                           help='directories to dedup (default: ["."])')
-    argparser.add_argument('--dot-files', action='store_false', dest='ignore_dot_files',
-                           help='include .* files (default: False)')
-    argparser.add_argument('-d', '--dot-dirs', action='store_false', dest='ignore_dot_dir',
-                           help='include .* directories (default: False)')
-    argparser.add_argument('-m', '--min-file-size', metavar='bytes', type=int, default=MIN_FILE_SIZE,
-                           help='minimum file size that will get linked (default: %d)' % MIN_FILE_SIZE)
-    argparser.add_argument('-H', '--history', metavar='CSV',
-                           help='previous CSV file (default: ~/%s)' % HISTORY_CSV)
-    verbosity = argparser.add_mutually_exclusive_group()
-    verbosity.add_argument('-q', '--quiet', action='store_const', dest='log_level',
-                           const=logging.WARNING, default=logging.INFO)
-    verbosity.add_argument('-v', '--verbose', action='store_const', dest='log_level',
-                           const=logging.DEBUG)
-
-    args = argparser.parse_args()
 
     logging.basicConfig(level=args.log_level)
     logging.info(args)
@@ -334,8 +313,31 @@ class HashGenerator(object):
         os.rename(tmp_history_csv, self._history_file)
         logging.info('wrote history (%d items) to %s', len(self._hash_by_ino), self._history_file)
 
-
 create_hash = HashGenerator(chunk_size=CHUNK_SIZE)
+
+
+def parse_args():
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument('dirs', metavar='DIRECTORY', nargs='*', default=[os.getcwd()],
+                           type=validate_path,
+                           help='directories to dedup (default: ["."])')
+    argparser.add_argument('--dot-files', action='store_false', dest='ignore_dot_files',
+                           help='include .* files (default: False)')
+    argparser.add_argument('--dot-dirs', action='store_false', dest='ignore_dot_dir',
+                           help='include .* directories (default: False)')
+    argparser.add_argument('-m', '--min-file-size', metavar='bytes', type=int, default=MIN_FILE_SIZE,
+                           help='minimum file size that will get linked (default: %d)' % MIN_FILE_SIZE)
+    argparser.add_argument('-H', '--history', metavar='CSV',
+                           help='previous CSV file (default: ~/%s)' % HISTORY_CSV)
+    verbosity = argparser.add_mutually_exclusive_group()
+    verbosity.add_argument('-q', '--quiet', action='store_const', dest='log_level',
+                           const=logging.WARNING, default=logging.INFO)
+    verbosity.add_argument('-v', '--verbose', action='store_const', dest='log_level',
+                           const=logging.DEBUG)
+
+    args = argparser.parse_args()
+
+    return args
 
 
 if __name__ == '__main__':
